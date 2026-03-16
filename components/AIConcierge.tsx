@@ -231,6 +231,8 @@ const AIConcierge: React.FC = () => {
   const [isModelTyping, setIsModelTyping] = useState(false);
   const [session, setSession] = useState<SessionData>(DEFAULT_SESSION);
   const [emailSent, setEmailSent] = useState(false);
+  const [streamingVoiceText, setStreamingVoiceText] = useState('');
+  const [streamingVoiceMsgId, setStreamingVoiceMsgId] = useState<string | null>(null);
 
   const hasAutoPopped = useRef(false);
   const welcomeSent = useRef(false);
@@ -464,18 +466,36 @@ WHAT TO SAY based on stage:
                 source.onended = () => sourcesRef.current.delete(source);
               }
 
-              // Handle text transcription from AI voice
+              // Handle text transcription from AI voice — stream live to chat
               if (part.text) {
                 aiVoiceTextRef.current += part.text;
+                const currentText = aiVoiceTextRef.current;
+                // Create a new message on first text chunk, then update it live
+                setStreamingVoiceMsgId(prevId => {
+                  if (!prevId) {
+                    const newId = Math.random().toString(36).substr(2, 9);
+                    setMessages(prev => [...prev, {
+                      id: newId,
+                      role: 'model',
+                      text: currentText,
+                      timestamp: new Date()
+                    }]);
+                    return newId;
+                  } else {
+                    // Update existing streaming message
+                    setMessages(prev => prev.map(m =>
+                      m.id === prevId ? { ...m, text: currentText } : m
+                    ));
+                    return prevId;
+                  }
+                });
               }
             }
 
-            // When model turn is complete, flush accumulated text to chat
+            // When model turn is complete, finalize the streaming message
             if (message.serverContent?.turnComplete) {
-              if (aiVoiceTextRef.current.trim()) {
-                addMessage('model', aiVoiceTextRef.current.trim());
-                aiVoiceTextRef.current = '';
-              }
+              aiVoiceTextRef.current = '';
+              setStreamingVoiceMsgId(null);
             }
 
             if (message.serverContent?.interrupted) stopAllAudio();
@@ -521,11 +541,9 @@ WHAT TO SAY based on stage:
       sessionRef.current = null;
     }
     stopAllAudio();
-    // Flush any remaining AI voice text
-    if (aiVoiceTextRef.current.trim()) {
-      addMessage('model', aiVoiceTextRef.current.trim());
-      aiVoiceTextRef.current = '';
-    }
+    aiVoiceTextRef.current = '';
+    setStreamingVoiceMsgId(null);
+    setStreamingVoiceText('');
     setIsListening(false);
     setMode('text');
   };
