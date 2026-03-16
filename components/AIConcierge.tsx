@@ -197,53 +197,44 @@ Best Time: ${session.bestTime}`;
   }
 }
 
-// Send lead email via FormSubmit (falls back to mailto)
+// Send lead email via Vercel API route (Nodemailer + Gmail SMTP)
 async function sendLeadEmail(session: SessionData, analysis: string) {
-  const emailData = {
-    _subject: `New EstatePro Lead: ${session.firstName || ''} ${session.lastName || ''}`.trim(),
-    _template: 'table',
-    'Lead Name': `${session.firstName || ''} ${session.lastName || ''}`.trim(),
-    'Phone': session.phone || 'Not provided',
-    'Email': session.email || 'Not provided',
-    'Intent': session.intent || 'Not specified',
-    'Location': session.location || 'Not specified',
-    'Budget': session.budget || 'Not specified',
-    'Timeline': session.timeline || 'Not specified',
-    'Financing': session.financing || 'N/A',
-    'Bedrooms': session.bedrooms || 'N/A',
-    'Zip Code': session.zipCode || 'N/A',
-    'Listing Preference': session.listingPreference || 'N/A',
-    'Contact Preference': session.contactPreference || 'Not specified',
-    'Best Time to Contact': session.bestTime || 'Not specified',
-    'Chat Analysis': analysis,
+  const payload = {
+    leadName: `${session.firstName || ''} ${session.lastName || ''}`.trim(),
+    phone: session.phone || '',
+    email: session.email || '',
+    intent: session.intent || '',
+    location: session.location || '',
+    budget: session.budget || '',
+    timeline: session.timeline || '',
+    financing: session.financing || '',
+    bedrooms: session.bedrooms || '',
+    zipCode: session.zipCode || '',
+    listingPreference: session.listingPreference || '',
+    contactPreference: session.contactPreference || '',
+    bestTime: session.bestTime || '',
+    analysis,
   };
 
   try {
-    const response = await fetch('https://formsubmit.co/ajax/subnest.ai@gmail.com', {
+    const response = await fetch('/api/send-email', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Accept': 'application/json'
       },
-      body: JSON.stringify(emailData)
+      body: JSON.stringify(payload),
     });
 
     if (response.ok) {
-      console.log('Lead email sent successfully via FormSubmit');
+      console.log('Lead email sent successfully');
       return true;
     }
-    throw new Error('FormSubmit response not OK');
+    const errorData = await response.json().catch(() => ({}));
+    console.error('Email API error:', errorData);
+    return false;
   } catch (err) {
-    console.warn('FormSubmit failed, trying mailto fallback:', err);
-    try {
-      const subject = encodeURIComponent(`New EstatePro Lead: ${session.firstName || ''} ${session.lastName || ''}`.trim());
-      const body = encodeURIComponent(analysis);
-      window.open(`mailto:subnest.ai@gmail.com?subject=${subject}&body=${body}`, '_blank');
-      return true;
-    } catch (mailtoErr) {
-      console.error('Email sending failed entirely:', mailtoErr);
-      return false;
-    }
+    console.error('Email sending failed:', err);
+    return false;
   }
 }
 
