@@ -43,10 +43,6 @@ async function decodeAudioData(
   return buffer;
 }
 
-// Storage keys
-const STORAGE_KEY = 'estatepro_chat_history';
-const SESSION_KEY = 'estatepro_session';
-
 // Session data interface for lead tracking
 interface SessionData {
   stage: 'intent' | 'core_needs' | 'core_needs_timeline' | 'intent_specific' | 'value_exchange' | 'lead_name' | 'lead_phone' | 'lead_email' | 'handoff' | 'complete';
@@ -252,42 +248,6 @@ const AIConcierge: React.FC = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
 
-  // Load chat history and session from localStorage
-  useEffect(() => {
-    const savedHistory = localStorage.getItem(STORAGE_KEY);
-    if (savedHistory) {
-      try {
-        const parsed = JSON.parse(savedHistory);
-        const revived = parsed.map((m: any) => ({
-          ...m,
-          timestamp: new Date(m.timestamp)
-        }));
-        setMessages(revived);
-      } catch (e) {
-        console.error('Failed to parse chat history', e);
-      }
-    }
-    const savedSession = localStorage.getItem(SESSION_KEY);
-    if (savedSession) {
-      try {
-        setSession(JSON.parse(savedSession));
-      } catch (e) {
-        console.error('Failed to parse session', e);
-      }
-    }
-  }, []);
-
-  // Save messages to localStorage
-  useEffect(() => {
-    if (messages.length > 0) {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(messages));
-    }
-  }, [messages]);
-
-  // Save session to localStorage
-  useEffect(() => {
-    localStorage.setItem(SESSION_KEY, JSON.stringify(session));
-  }, [session]);
 
   useEffect(() => {
     scrollToBottom();
@@ -328,13 +288,11 @@ const AIConcierge: React.FC = () => {
   }, []);
 
   const clearHistory = () => {
-    if (window.confirm('Clear all chat history? This will also reset the conversation flow.')) {
+    if (window.confirm('Clear chat and start over?')) {
       setMessages([]);
       setSession(DEFAULT_SESSION);
       setEmailSent(false);
       welcomeSent.current = false;
-      localStorage.removeItem(STORAGE_KEY);
-      localStorage.removeItem(SESSION_KEY);
     }
   };
 
