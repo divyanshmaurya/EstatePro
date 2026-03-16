@@ -231,8 +231,6 @@ const AIConcierge: React.FC = () => {
   const [isModelTyping, setIsModelTyping] = useState(false);
   const [session, setSession] = useState<SessionData>(DEFAULT_SESSION);
   const [emailSent, setEmailSent] = useState(false);
-  const [streamingVoiceText, setStreamingVoiceText] = useState('');
-  const [streamingVoiceMsgId, setStreamingVoiceMsgId] = useState<string | null>(null);
 
   const hasAutoPopped = useRef(false);
   const welcomeSent = useRef(false);
@@ -430,7 +428,7 @@ WHAT TO SAY based on stage:
 - complete: Just chat naturally about properties.`;
 
       const sessionPromise = ai.live.connect({
-        model: 'gemini-2.5-flash',
+        model: 'gemini-2.5-flash-native-audio-preview-12-2025',
         callbacks: {
           onopen: () => {
             setIsConnecting(false);
@@ -466,36 +464,36 @@ WHAT TO SAY based on stage:
                 source.onended = () => sourcesRef.current.delete(source);
               }
 
-              // Handle text transcription from AI voice — stream live to chat
-              if (part.text) {
-                aiVoiceTextRef.current += part.text;
-                const currentText = aiVoiceTextRef.current;
-                // Create a new message on first text chunk, then update it live
-                setStreamingVoiceMsgId(prevId => {
-                  if (!prevId) {
-                    const newId = Math.random().toString(36).substr(2, 9);
-                    setMessages(prev => [...prev, {
-                      id: newId,
-                      role: 'model',
-                      text: currentText,
-                      timestamp: new Date()
-                    }]);
-                    return newId;
-                  } else {
-                    // Update existing streaming message
-                    setMessages(prev => prev.map(m =>
-                      m.id === prevId ? { ...m, text: currentText } : m
-                    ));
-                    return prevId;
-                  }
-                });
-              }
             }
 
-            // When model turn is complete, finalize the streaming message
+            // When model turn is complete, get clean text via separate text call
             if (message.serverContent?.turnComplete) {
-              aiVoiceTextRef.current = '';
-              setStreamingVoiceMsgId(null);
+              (async () => {
+                try {
+                  const textAi = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
+                  // Get recent messages for context
+                  const recentMsgs = messages.slice(-10).map(m => ({
+                    role: m.role as 'user' | 'model',
+                    parts: [{ text: m.text }]
+                  }));
+                  const textResponse = await textAi.models.generateContent({
+                    model: 'gemini-2.5-flash',
+                    contents: recentMsgs.length > 0 ? recentMsgs : 'Hello',
+                    config: {
+                      systemInstruction: `You are a friendly real estate assistant. Based on the conversation so far, write ONLY what you would say next. Keep it short (1-3 sentences), casual, warm. No markdown, no internal reasoning. Just the spoken words.
+
+PROPERTY PORTFOLIO: ${JSON.stringify(PROPERTIES)}
+COLLECTED DATA: ${JSON.stringify(session)}`
+                    }
+                  });
+                  const text = textResponse.text?.trim();
+                  if (text) {
+                    addMessage('model', text);
+                  }
+                } catch (err) {
+                  console.error('Voice text transcription failed:', err);
+                }
+              })();
             }
 
             if (message.serverContent?.interrupted) stopAllAudio();
@@ -542,8 +540,6 @@ WHAT TO SAY based on stage:
     }
     stopAllAudio();
     aiVoiceTextRef.current = '';
-    setStreamingVoiceMsgId(null);
-    setStreamingVoiceText('');
     setIsListening(false);
     setMode('text');
   };
