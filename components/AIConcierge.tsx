@@ -1,10 +1,10 @@
 
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
 import { Icons, PROPERTIES } from '../constants';
 import { ChatMessage } from '../types';
 
-// Utility functions for audio
+// Audio utility functions
 function encode(bytes: Uint8Array) {
   let binary = '';
   const len = bytes.byteLength;
@@ -43,7 +43,209 @@ async function decodeAudioData(
   return buffer;
 }
 
+// Storage keys
 const STORAGE_KEY = 'estatepro_chat_history';
+const SESSION_KEY = 'estatepro_session';
+
+// Session data interface for lead tracking
+interface SessionData {
+  stage: 'intent' | 'core_needs' | 'core_needs_timeline' | 'intent_specific' | 'value_exchange' | 'lead_name' | 'lead_phone' | 'lead_email' | 'handoff' | 'complete';
+  intent?: string;
+  location?: string;
+  budget?: string;
+  timeline?: string;
+  financing?: string;
+  bedrooms?: string;
+  zipCode?: string;
+  listingPreference?: string;
+  firstName?: string;
+  lastName?: string;
+  phone?: string;
+  email?: string;
+  contactPreference?: string;
+  bestTime?: string;
+}
+
+const DEFAULT_SESSION: SessionData = { stage: 'intent' };
+
+const WELCOME_MESSAGE = "Hi! I'm your real estate AI assistant. I can help you buy, rent, or sell... Are you looking to buy, rent, or sell today?";
+
+// Build dynamic system instruction based on conversation stage
+function buildSystemInstruction(session: SessionData): string {
+  return `You are EstatePro's AI real estate assistant. You MUST follow the conversation script below strictly based on the CURRENT STAGE.
+
+CURRENT STAGE: ${session.stage}
+COLLECTED DATA SO FAR: ${JSON.stringify(session)}
+
+AVAILABLE PROPERTY PORTFOLIO:
+${JSON.stringify(PROPERTIES)}
+
+=== CONVERSATION FLOW STAGES ===
+
+STAGE: intent
+- The user was just asked: "Are you looking to buy, rent, or sell today?"
+- Your job: Extract their intent (buy, rent, or sell).
+- If their answer is unclear, respond EXACTLY: "Sorry, I didn't catch that. Are you looking to buy, rent, or sell?"
+- Once you identify intent, respond warmly confirming their intent and ask: "Great! Which area are you targeting? And what's your approximate budget range?"
+
+STAGE: core_needs
+- You asked about area and budget. Extract Location and Budget from their response.
+- Then ask: "What's your timeline?"
+- If they gave both area/budget AND timeline in one message, extract all three.
+
+STAGE: core_needs_timeline
+- Extract the timeline from their response.
+- Then ask the intent-specific question:
+  - If intent is "buy": "Are you already pre-approved for a mortgage, or paying cash?"
+  - If intent is "rent": "How many bedrooms are you looking for?"
+  - If intent is "sell": "What's the zip code of the property you'd like to sell?"
+
+STAGE: intent_specific
+- Extract the intent-specific answer:
+  - Buy: financing status (mortgage/cash/pre-approved)
+  - Rent: number of bedrooms
+  - Sell: zip code
+- Then based on ALL collected criteria (location, budget, intent), pick 2 properties from the portfolio that best match.
+- Respond: "Found it! I'll share 2 quick previews...
+
+  Preview 1: [Price] in [Location]. Highlight: [Key amenity/feature].
+  Preview 2: [Price] in [Location]. Highlight: [Key amenity/feature].
+
+  Which one interests you more—1 or 2?"
+
+STAGE: value_exchange
+- Extract which option they prefer (1 or 2).
+- Then say: "These look like a great match! May I have your name?"
+
+STAGE: lead_name
+- Extract their name (First Name and Last Name). If only one name given, use it as firstName.
+- Then say: "Thanks, [FirstName]! To send you the full photos and details, what's your cell phone number?"
+
+STAGE: lead_phone
+- Extract their phone number.
+- If they refuse or don't provide a number, use this HARD RECOVERY: "I do need a way to send you the photos... how about just sharing your number for now?"
+- Phone is STRICTLY required. Keep asking until provided.
+- Once phone is captured, say: "Got it! What's your email address?"
+
+STAGE: lead_email
+- Extract their email address. If they skip, that's acceptable.
+- Then say: "Finally, do you prefer our agent to reach out by text or call? And what time works best for you?"
+
+STAGE: handoff
+- Extract their contact preference (text/call) and best time.
+- Confirm everything warmly: "Perfect, [Name]! Our agent will [text/call] you around [time]. We're excited to help you find the perfect property!"
+
+STAGE: complete
+- The conversation flow is done. Answer any follow-up questions naturally using the property portfolio.
+
+=== CRITICAL RULES ===
+1. ONLY handle the CURRENT STAGE. Do NOT skip ahead or go backwards.
+2. Be warm, professional, and concise.
+3. After your natural response, you MUST output extraction data on a NEW line in this EXACT format:
+|||EXTRACT|||{"stage":"${session.stage}","next_stage":"<stage_to_move_to>","data":{<key_value_pairs_extracted>}}|||END|||
+
+EXTRACTION RULES:
+- "next_stage" should be the NEXT stage if you successfully extracted what was needed, otherwise keep it as the current stage.
+- Stage transitions: intent→core_needs, core_needs→core_needs_timeline, core_needs_timeline→intent_specific, intent_specific→value_exchange, value_exchange→lead_name, lead_name→lead_phone, lead_phone→lead_email, lead_email→handoff, handoff→complete
+- "data" keys should match the SessionData fields: intent, location, budget, timeline, financing, bedrooms, zipCode, listingPreference, firstName, lastName, phone, email, contactPreference, bestTime
+- If you extracted multiple fields in one exchange, include all of them.
+- If the user gave a combined answer that covers multiple stages (e.g., location + budget + timeline at once), extract all data but only advance ONE stage at a time. Exception: if core_needs gets both location+budget, advance to core_needs_timeline.
+- The |||EXTRACT||| line must NEVER be visible in your conversational response.`;
+}
+
+// Generate chat analysis for email
+async function generateChatAnalysis(messages: (ChatMessage & { grounding?: any[] })[], session: SessionData): Promise<string> {
+  try {
+    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
+    const chatLog = messages.map(m => `${m.role === 'user' ? 'Customer' : 'Assistant'}: ${m.text}`).join('\n');
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: `Analyze this real estate lead conversation and provide a structured summary for the sales agent:
+
+CONVERSATION LOG:
+${chatLog}
+
+COLLECTED LEAD DATA:
+${JSON.stringify(session, null, 2)}
+
+Provide:
+1. Lead Quality Assessment (Hot/Warm/Cold)
+2. Customer Intent: ${session.intent || 'Unknown'}
+3. Key Requirements Summary
+4. Recommended Follow-up Approach
+5. Notable Preferences or Concerns
+6. Complete Contact Details`,
+      config: {
+        systemInstruction: 'You are a real estate lead analyst. Provide a concise, professional analysis formatted for an agent to quickly review before contacting the lead.'
+      }
+    });
+
+    return response.text || 'Analysis generation failed.';
+  } catch (err) {
+    console.error('Analysis generation failed:', err);
+    return `Lead Summary:
+Name: ${session.firstName} ${session.lastName}
+Phone: ${session.phone}
+Email: ${session.email || 'Not provided'}
+Intent: ${session.intent}
+Location: ${session.location}
+Budget: ${session.budget}
+Timeline: ${session.timeline}
+Contact Preference: ${session.contactPreference}
+Best Time: ${session.bestTime}`;
+  }
+}
+
+// Send lead email via FormSubmit (falls back to mailto)
+async function sendLeadEmail(session: SessionData, analysis: string) {
+  const emailData = {
+    _subject: `New EstatePro Lead: ${session.firstName || ''} ${session.lastName || ''}`.trim(),
+    _template: 'table',
+    'Lead Name': `${session.firstName || ''} ${session.lastName || ''}`.trim(),
+    'Phone': session.phone || 'Not provided',
+    'Email': session.email || 'Not provided',
+    'Intent': session.intent || 'Not specified',
+    'Location': session.location || 'Not specified',
+    'Budget': session.budget || 'Not specified',
+    'Timeline': session.timeline || 'Not specified',
+    'Financing': session.financing || 'N/A',
+    'Bedrooms': session.bedrooms || 'N/A',
+    'Zip Code': session.zipCode || 'N/A',
+    'Listing Preference': session.listingPreference || 'N/A',
+    'Contact Preference': session.contactPreference || 'Not specified',
+    'Best Time to Contact': session.bestTime || 'Not specified',
+    'Chat Analysis': analysis,
+  };
+
+  try {
+    const response = await fetch('https://formsubmit.co/ajax/subnest.ai@gmail.com', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+      },
+      body: JSON.stringify(emailData)
+    });
+
+    if (response.ok) {
+      console.log('Lead email sent successfully via FormSubmit');
+      return true;
+    }
+    throw new Error('FormSubmit response not OK');
+  } catch (err) {
+    console.warn('FormSubmit failed, trying mailto fallback:', err);
+    try {
+      const subject = encodeURIComponent(`New EstatePro Lead: ${session.firstName || ''} ${session.lastName || ''}`.trim());
+      const body = encodeURIComponent(analysis);
+      window.open(`mailto:subnest.ai@gmail.com?subject=${subject}&body=${body}`, '_blank');
+      return true;
+    } catch (mailtoErr) {
+      console.error('Email sending failed entirely:', mailtoErr);
+      return false;
+    }
+  }
+}
 
 const AIConcierge: React.FC = () => {
   const [isOpen, setIsOpen] = useState(false);
@@ -53,20 +255,26 @@ const AIConcierge: React.FC = () => {
   const [isConnecting, setIsConnecting] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [isModelTyping, setIsModelTyping] = useState(false);
-  
-  const hasAutoPopped = useRef(false);
+  const [session, setSession] = useState<SessionData>(DEFAULT_SESSION);
+  const [emailSent, setEmailSent] = useState(false);
 
+  const hasAutoPopped = useRef(false);
+  const welcomeSent = useRef(false);
   const audioContextRef = useRef<AudioContext | null>(null);
   const outputAudioContextRef = useRef<AudioContext | null>(null);
   const sessionRef = useRef<any>(null);
   const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const nextStartTimeRef = useRef<number>(0);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const speechRecognitionRef = useRef<any>(null);
+  const aiVoiceTextRef = useRef<string>('');
+  const mediaStreamRef = useRef<MediaStream | null>(null);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
 
+  // Load chat history and session from localStorage
   useEffect(() => {
     const savedHistory = localStorage.getItem(STORAGE_KEY);
     if (savedHistory) {
@@ -81,18 +289,33 @@ const AIConcierge: React.FC = () => {
         console.error('Failed to parse chat history', e);
       }
     }
+    const savedSession = localStorage.getItem(SESSION_KEY);
+    if (savedSession) {
+      try {
+        setSession(JSON.parse(savedSession));
+      } catch (e) {
+        console.error('Failed to parse session', e);
+      }
+    }
   }, []);
 
+  // Save messages to localStorage
   useEffect(() => {
     if (messages.length > 0) {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(messages));
     }
   }, [messages]);
 
+  // Save session to localStorage
+  useEffect(() => {
+    localStorage.setItem(SESSION_KEY, JSON.stringify(session));
+  }, [session]);
+
   useEffect(() => {
     scrollToBottom();
   }, [messages, isOpen]);
 
+  // Auto-pop chatbot near page bottom
   useEffect(() => {
     const handleScroll = () => {
       if (hasAutoPopped.current) return;
@@ -108,7 +331,15 @@ const AIConcierge: React.FC = () => {
     return () => window.removeEventListener('scroll', handleScroll);
   }, []);
 
-  const addMessage = (role: 'user' | 'model', text: string, grounding?: any[]) => {
+  // Send welcome message when chat opens for the first time
+  useEffect(() => {
+    if (isOpen && messages.length === 0 && !welcomeSent.current) {
+      welcomeSent.current = true;
+      addMessage('model', WELCOME_MESSAGE);
+    }
+  }, [isOpen]);
+
+  const addMessage = useCallback((role: 'user' | 'model', text: string, grounding?: any[]) => {
     setMessages(prev => [...prev, {
       id: Math.random().toString(36).substr(2, 9),
       role,
@@ -116,12 +347,16 @@ const AIConcierge: React.FC = () => {
       timestamp: new Date(),
       grounding
     }]);
-  };
+  }, []);
 
   const clearHistory = () => {
-    if (window.confirm('Clear all chat history?')) {
+    if (window.confirm('Clear all chat history? This will also reset the conversation flow.')) {
       setMessages([]);
+      setSession(DEFAULT_SESSION);
+      setEmailSent(false);
+      welcomeSent.current = false;
       localStorage.removeItem(STORAGE_KEY);
+      localStorage.removeItem(SESSION_KEY);
     }
   };
 
@@ -133,17 +368,120 @@ const AIConcierge: React.FC = () => {
     nextStartTimeRef.current = 0;
   };
 
+  // Process extraction data from AI response
+  const processExtraction = useCallback(async (fullText: string, allMessages: (ChatMessage & { grounding?: any[] })[]) => {
+    if (!fullText.includes('|||EXTRACT|||')) return fullText;
+
+    const parts = fullText.split('|||EXTRACT|||');
+    const displayText = parts[0].trim();
+    const jsonStr = parts[1]?.split('|||END|||')[0]?.trim();
+
+    if (jsonStr) {
+      try {
+        const extracted = JSON.parse(jsonStr);
+        setSession(prev => {
+          const updated = { ...prev };
+          if (extracted.data) {
+            Object.entries(extracted.data).forEach(([key, value]) => {
+              if (value !== undefined && value !== null && value !== '') {
+                (updated as any)[key] = value;
+              }
+            });
+          }
+          if (extracted.next_stage) {
+            updated.stage = extracted.next_stage;
+          }
+
+          // Trigger email when handoff completes
+          if (updated.stage === 'complete' && updated.bestTime && !emailSent) {
+            setEmailSent(true);
+            // Run async email sending
+            (async () => {
+              try {
+                const analysis = await generateChatAnalysis(allMessages, updated);
+                await sendLeadEmail(updated, analysis);
+                addMessage('model', 'I\'ve notified our agent team with your details. They\'ll be reaching out soon!');
+              } catch (err) {
+                console.error('Email notification failed:', err);
+              }
+            })();
+          }
+
+          return updated;
+        });
+      } catch (e) {
+        console.error('Failed to parse extraction data:', e, jsonStr);
+      }
+    }
+
+    return displayText;
+  }, [emailSent, addMessage]);
+
+  // Voice session management
   const startVoiceSession = async () => {
     if (isConnecting) return;
     setIsConnecting(true);
     setMode('voice');
-    
+
     try {
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
       if (!audioContextRef.current) audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
       if (!outputAudioContextRef.current) outputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
 
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaStreamRef.current = stream;
+
+      // Start Web Speech API for user transcription
+      const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+      if (SpeechRecognition) {
+        const recognition = new SpeechRecognition();
+        recognition.continuous = true;
+        recognition.interimResults = false;
+        recognition.lang = 'en-US';
+        recognition.onresult = (event: any) => {
+          const last = event.results.length - 1;
+          const transcript = event.results[last][0].transcript.trim();
+          if (transcript) {
+            addMessage('user', transcript);
+          }
+        };
+        recognition.onerror = (e: any) => {
+          console.warn('Speech recognition error:', e.error);
+          if (e.error !== 'aborted') {
+            try { recognition.start(); } catch (_) {}
+          }
+        };
+        recognition.onend = () => {
+          // Restart if still in voice mode
+          if (mode === 'voice' && isListening) {
+            try { recognition.start(); } catch (_) {}
+          }
+        };
+        recognition.start();
+        speechRecognitionRef.current = recognition;
+      }
+
+      // Build voice system instruction (same flow but without extraction tags)
+      const voiceSystemInstruction = `You are EstatePro's AI real estate assistant having a voice conversation. Follow this conversation flow naturally:
+
+CURRENT STAGE: ${session.stage}
+COLLECTED DATA: ${JSON.stringify(session)}
+PROPERTY PORTFOLIO: ${JSON.stringify(PROPERTIES)}
+
+CONVERSATION FLOW:
+1. If stage is 'intent': The user was asked if they want to buy, rent, or sell. Identify their intent. If unclear say "Sorry, I didn't catch that. Are you looking to buy, rent, or sell?"
+2. If stage is 'core_needs': Ask about their target area and budget range.
+3. If stage is 'core_needs_timeline': Ask about their timeline.
+4. If stage is 'intent_specific': For buy ask about mortgage pre-approval or cash. For rent ask about bedrooms. For sell ask about zip code.
+5. If stage is 'value_exchange': Present 2 matching property previews and ask which interests them more.
+6. If stage is 'lead_name': Ask for their name.
+7. If stage is 'lead_phone': Ask for their cell phone number. If refused, use hard recovery: "I do need a way to send you the photos... how about just sharing your number for now?"
+8. If stage is 'lead_email': Ask for their email address.
+9. If stage is 'handoff': Ask if they prefer text or call, and what time works best.
+10. If stage is 'complete': Answer any follow-up questions.
+
+Be warm, concise, and professional. Speak naturally as in a phone conversation.`;
+
       const sessionPromise = ai.live.connect({
         model: 'gemini-2.5-flash-native-audio-preview-12-2025',
         callbacks: {
@@ -164,40 +502,85 @@ const AIConcierge: React.FC = () => {
             scriptProcessor.connect(audioContextRef.current!.destination);
           },
           onmessage: async (message: LiveServerMessage) => {
-            const base64Audio = message.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
-            if (base64Audio && outputAudioContextRef.current) {
-              const ctx = outputAudioContextRef.current;
-              nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
-              const audioBuffer = await decodeAudioData(decode(base64Audio), ctx, 24000, 1);
-              const source = ctx.createBufferSource();
-              source.buffer = audioBuffer;
-              source.connect(ctx.destination);
-              source.start(nextStartTimeRef.current);
-              nextStartTimeRef.current += audioBuffer.duration;
-              sourcesRef.current.add(source);
-              source.onended = () => sourcesRef.current.delete(source);
+            const parts = message.serverContent?.modelTurn?.parts || [];
+
+            for (const part of parts) {
+              // Handle audio playback
+              if (part.inlineData?.data && outputAudioContextRef.current) {
+                const ctx = outputAudioContextRef.current;
+                nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
+                const audioBuffer = await decodeAudioData(decode(part.inlineData.data), ctx, 24000, 1);
+                const source = ctx.createBufferSource();
+                source.buffer = audioBuffer;
+                source.connect(ctx.destination);
+                source.start(nextStartTimeRef.current);
+                nextStartTimeRef.current += audioBuffer.duration;
+                sourcesRef.current.add(source);
+                source.onended = () => sourcesRef.current.delete(source);
+              }
+
+              // Handle text transcription from AI voice
+              if (part.text) {
+                aiVoiceTextRef.current += part.text;
+              }
             }
+
+            // When model turn is complete, flush accumulated text to chat
+            if (message.serverContent?.turnComplete) {
+              if (aiVoiceTextRef.current.trim()) {
+                addMessage('model', aiVoiceTextRef.current.trim());
+                aiVoiceTextRef.current = '';
+              }
+            }
+
             if (message.serverContent?.interrupted) stopAllAudio();
           },
-          onerror: (e) => { setIsConnecting(false); setIsListening(false); },
-          onclose: () => { setIsListening(false); setIsConnecting(false); }
+          onerror: (e) => {
+            console.error('Voice session error:', e);
+            setIsConnecting(false);
+            setIsListening(false);
+          },
+          onclose: () => {
+            setIsListening(false);
+            setIsConnecting(false);
+          }
         },
         config: {
           responseModalities: [Modality.AUDIO],
-          systemInstruction: `You are the EstatePro Assistant. Portfolio: ${JSON.stringify(PROPERTIES)}.`,
+          systemInstruction: voiceSystemInstruction,
           speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } } }
         }
       });
       sessionRef.current = await sessionPromise;
     } catch (err) {
-      console.error(err);
+      console.error('Voice session start failed:', err);
       setIsConnecting(false);
+      setMode('text');
     }
   };
 
   const stopVoiceSession = () => {
-    if (sessionRef.current) { sessionRef.current.close(); sessionRef.current = null; }
+    // Stop speech recognition
+    if (speechRecognitionRef.current) {
+      try { speechRecognitionRef.current.stop(); } catch (_) {}
+      speechRecognitionRef.current = null;
+    }
+    // Stop media stream
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach(track => track.stop());
+      mediaStreamRef.current = null;
+    }
+    // Close Gemini session
+    if (sessionRef.current) {
+      sessionRef.current.close();
+      sessionRef.current = null;
+    }
     stopAllAudio();
+    // Flush any remaining AI voice text
+    if (aiVoiceTextRef.current.trim()) {
+      addMessage('model', aiVoiceTextRef.current.trim());
+      aiVoiceTextRef.current = '';
+    }
     setIsListening(false);
     setMode('text');
   };
@@ -212,30 +595,70 @@ const AIConcierge: React.FC = () => {
 
     try {
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
+
+      // Build conversation history for context
+      const history = messages.map(m => ({
+        role: m.role as 'user' | 'model',
+        parts: [{ text: m.text }]
+      }));
+      history.push({ role: 'user' as const, parts: [{ text: userText }] });
+
       const response = await ai.models.generateContent({
         model: 'gemini-2.5-flash',
-        contents: userText,
+        contents: history,
         config: {
           tools: [{ googleMaps: {} }],
-          systemInstruction: `You are the EstatePro Assistant. Portfolio: ${JSON.stringify(PROPERTIES)}.`
+          systemInstruction: buildSystemInstruction(session)
         }
       });
-      const text = response.text || "I apologize, I'm unable to process that at the moment.";
+
+      let fullText = response.text || "I apologize, I'm unable to process that at the moment.";
       const grounding = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
-      addMessage('model', text, grounding);
+
+      // Process extraction and get display text
+      const updatedMessages = [...messages, {
+        id: Math.random().toString(36).substr(2, 9),
+        role: 'user' as const,
+        text: userText,
+        timestamp: new Date()
+      }];
+      const displayText = await processExtraction(fullText, updatedMessages);
+      addMessage('model', displayText, grounding);
     } catch (error) {
-      addMessage('model', "I'm experiencing a minor connectivity interruption.");
+      console.error('Text submit error:', error);
+      addMessage('model', "I'm experiencing a minor connectivity interruption. Please try again.");
     } finally {
       setIsModelTyping(false);
     }
   };
 
-  const handleClose = () => { stopVoiceSession(); setIsOpen(false); };
+  const handleClose = () => {
+    stopVoiceSession();
+    setIsOpen(false);
+  };
+
+  // Stage indicator for UI
+  const getStageLabel = (): string => {
+    const labels: Record<string, string> = {
+      intent: 'Getting Started',
+      core_needs: 'Understanding Needs',
+      core_needs_timeline: 'Timeline',
+      intent_specific: 'Details',
+      value_exchange: 'Property Matching',
+      lead_name: 'Almost There',
+      lead_phone: 'Contact Info',
+      lead_email: 'Contact Info',
+      handoff: 'Scheduling',
+      complete: 'Connected'
+    };
+    return labels[session.stage] || '';
+  };
 
   return (
     <div className="fixed bottom-8 right-8 z-[60] flex flex-col items-end">
       {isOpen && (
         <div className="mb-4 w-[400px] h-[600px] bg-white rounded-3xl shadow-2xl flex flex-col overflow-hidden border border-slate-200 animate-in slide-in-from-bottom-4 duration-300">
+          {/* Header */}
           <div className="bg-red-950 p-6 text-white flex justify-between items-center">
             <div className="flex items-center gap-3">
               <div className="w-10 h-10 bg-red-600 rounded-xl flex items-center justify-center">
@@ -243,7 +666,11 @@ const AIConcierge: React.FC = () => {
               </div>
               <div>
                 <h3 className="font-bold tracking-tight">AI Assistant</h3>
-                {mode === 'voice' && <p className="text-[10px] text-red-400 uppercase tracking-widest">Listening...</p>}
+                {mode === 'voice' ? (
+                  <p className="text-[10px] text-red-400 uppercase tracking-widest">Listening...</p>
+                ) : (
+                  <p className="text-[10px] text-red-300 uppercase tracking-widest">{getStageLabel()}</p>
+                )}
               </div>
             </div>
             <div className="flex items-center gap-2">
@@ -256,18 +683,17 @@ const AIConcierge: React.FC = () => {
             </div>
           </div>
 
+          {/* Messages area */}
           <div className="flex-grow overflow-y-auto p-6 space-y-4 bg-slate-50">
-            {messages.length === 0 && (
-              <div className="text-center py-10">
-                <div className="w-16 h-16 bg-white border border-slate-200 rounded-2xl flex items-center justify-center mx-auto mb-4 text-red-600 shadow-sm"><Icons.Chat /></div>
-                <h4 className="font-bold text-slate-900 mb-2">EstatePro Concierge</h4>
-                <p className="text-slate-500 text-sm max-w-[240px] mx-auto leading-relaxed">How can I assist you with our portfolio today?</p>
-              </div>
-            )}
             {messages.map((m) => (
               <div key={m.id} className={`flex flex-col ${m.role === 'user' ? 'items-end' : 'items-start'}`}>
                 <div className={`max-w-[85%] p-4 rounded-2xl text-sm leading-relaxed shadow-sm ${m.role === 'user' ? 'bg-red-600 text-white rounded-tr-none' : 'bg-white text-slate-700 border border-slate-100 rounded-tl-none'}`}>
-                  {m.text}
+                  {m.text.split('\n').map((line, i) => (
+                    <React.Fragment key={i}>
+                      {i > 0 && <br />}
+                      {line}
+                    </React.Fragment>
+                  ))}
                   {m.grounding && m.grounding.length > 0 && (
                     <div className="mt-3 pt-3 border-t border-slate-100 space-y-1">
                       <p className="text-[10px] font-bold text-red-400 uppercase tracking-tighter">Verified Locations</p>
@@ -278,18 +704,26 @@ const AIConcierge: React.FC = () => {
                 <span className="text-[10px] text-slate-400 mt-1 px-1">{m.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
               </div>
             ))}
-            {isModelTyping && <div className="flex gap-1 p-2"><div className="w-1 h-1 bg-red-400 rounded-full animate-bounce" /><div className="w-1 h-1 bg-red-400 rounded-full animate-bounce" style={{ animationDelay: '0.2s' }} /><div className="w-1 h-1 bg-red-400 rounded-full animate-bounce" style={{ animationDelay: '0.4s' }} /></div>}
+            {isModelTyping && (
+              <div className="flex gap-1 p-2">
+                <div className="w-1 h-1 bg-red-400 rounded-full animate-bounce" />
+                <div className="w-1 h-1 bg-red-400 rounded-full animate-bounce" style={{ animationDelay: '0.2s' }} />
+                <div className="w-1 h-1 bg-red-400 rounded-full animate-bounce" style={{ animationDelay: '0.4s' }} />
+              </div>
+            )}
             {mode === 'voice' && (
               <div className="flex flex-col items-center justify-center py-12 space-y-4">
                 <div className="flex items-end gap-1.5 h-16">
                   {[...Array(7)].map((_, i) => <div key={i} className="w-1.5 bg-red-600 rounded-full animate-pulse" style={{ animationDelay: `${i * 0.1}s`, height: isListening ? `${24 + Math.random() * 40}px` : '6px' }} />)}
                 </div>
+                <p className="text-xs text-slate-500">Voice conversation is being transcribed below</p>
                 <button onClick={stopVoiceSession} className="mt-6 bg-red-950 text-white px-8 py-3 rounded-xl text-sm font-bold shadow-lg hover:bg-red-600 transition-all active:scale-95">Return to Text</button>
               </div>
             )}
             <div ref={messagesEndRef} />
           </div>
 
+          {/* Input area */}
           {mode === 'text' && (
             <div className="p-4 bg-white border-t border-slate-100">
               <form onSubmit={handleTextSubmit} className="flex gap-2 mb-2">
@@ -298,7 +732,7 @@ const AIConcierge: React.FC = () => {
               </form>
               <div className="flex justify-between items-center px-1">
                 <button type="button" onClick={startVoiceSession} className="flex items-center gap-1.5 text-red-600 text-[11px] font-bold hover:text-red-700 transition-colors"><Icons.Mic />Talk</button>
-                <p className="text-[9px] text-slate-400 font-medium uppercase tracking-widest">Sterling Assistant v2.5</p>
+                <p className="text-[9px] text-slate-400 font-medium uppercase tracking-widest">EstatePro AI v3.0</p>
               </div>
             </div>
           )}
@@ -308,7 +742,7 @@ const AIConcierge: React.FC = () => {
       {!isOpen && (
         <button onClick={() => setIsOpen(true)} className="bg-red-950 text-white w-14 h-14 rounded-2xl shadow-2xl flex items-center justify-center hover:scale-105 transition-all active:scale-95 group relative border border-white/10">
           <Icons.Chat />
-          <span className="absolute -top-12 right-0 bg-red-950 text-white px-4 py-2 rounded-xl text-xs font-bold whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity shadow-xl border border-white/10">Assistant</span>
+          <span className="absolute -top-12 right-0 bg-red-950 text-white px-4 py-2 rounded-xl text-xs font-bold whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity shadow-xl border border-white/10">AI Assistant</span>
         </button>
       )}
     </div>
