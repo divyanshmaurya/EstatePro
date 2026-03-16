@@ -243,11 +243,17 @@ const AIConcierge: React.FC = () => {
   const speechRecognitionRef = useRef<any>(null);
   const aiVoiceTextRef = useRef<string>('');
   const mediaStreamRef = useRef<MediaStream | null>(null);
+  const messagesRef = useRef<(ChatMessage & { grounding?: any[] })[]>([]);
+  const sessionDataRef = useRef<SessionData>(DEFAULT_SESSION);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
 
+
+  // Keep refs in sync for use inside callbacks
+  useEffect(() => { messagesRef.current = messages; }, [messages]);
+  useEffect(() => { sessionDataRef.current = session; }, [session]);
 
   useEffect(() => {
     scrollToBottom();
@@ -471,19 +477,25 @@ WHAT TO SAY based on stage:
               (async () => {
                 try {
                   const textAi = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
-                  // Get recent messages for context
-                  const recentMsgs = messages.slice(-10).map(m => ({
+                  const currentMessages = messagesRef.current;
+                  const currentSession = sessionDataRef.current;
+                  // Build conversation history from latest messages
+                  const recentMsgs = currentMessages.slice(-10).map(m => ({
                     role: m.role as 'user' | 'model',
                     parts: [{ text: m.text }]
                   }));
+                  // If no messages yet, use a starter
+                  if (recentMsgs.length === 0) {
+                    recentMsgs.push({ role: 'user' as const, parts: [{ text: 'Hello' }] });
+                  }
                   const textResponse = await textAi.models.generateContent({
                     model: 'gemini-2.5-flash',
-                    contents: recentMsgs.length > 0 ? recentMsgs : 'Hello',
+                    contents: recentMsgs,
                     config: {
-                      systemInstruction: `You are a friendly real estate assistant. Based on the conversation so far, write ONLY what you would say next. Keep it short (1-3 sentences), casual, warm. No markdown, no internal reasoning. Just the spoken words.
+                      systemInstruction: `You are a friendly real estate assistant. Based on the conversation so far, write EXACTLY what you would say out loud as your next response. Keep it short (1-3 sentences), casual, warm. No markdown, no headers, no internal reasoning. Just the spoken words — nothing else.
 
 PROPERTY PORTFOLIO: ${JSON.stringify(PROPERTIES)}
-COLLECTED DATA: ${JSON.stringify(session)}`
+COLLECTED DATA: ${JSON.stringify(currentSession)}`
                     }
                   });
                   const text = textResponse.text?.trim();
