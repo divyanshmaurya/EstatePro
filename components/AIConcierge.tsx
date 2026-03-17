@@ -1,560 +1,552 @@
 
-import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
-import { Icons, PROPERTIES } from '../constants';
-import { ChatMessage } from '../types';
+import React, { useState, useRef, useEffect } from 'react';
+import { MessageSquare, Mic, Send, X, Volume2, Loader2, MicOff } from 'lucide-react';
+import { gemini, GeminiService } from '../services/gemini';
+import { CHATBOT_FLOW_INSTRUCTION, VOICE_FLOW_INSTRUCTION } from '../constants';
+import { GoogleGenAI, Modality, Type } from '@google/genai';
+import { ChatStage, ChatSessionData, ChatMessage } from '../types';
 
-// Audio helpers
-function pcmEncode(bytes: Uint8Array): string {
-  let binary = '';
-  for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
-  return btoa(binary);
-}
-
-function pcmDecode(base64: string): Uint8Array {
-  const bin = atob(base64);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  return bytes;
-}
-
-async function toAudioBuffer(data: Uint8Array, ctx: AudioContext, rate: number): Promise<AudioBuffer> {
-  const int16 = new Int16Array(data.buffer);
-  const buf = ctx.createBuffer(1, int16.length, rate);
-  const channel = buf.getChannelData(0);
-  for (let i = 0; i < int16.length; i++) channel[i] = int16[i] / 32768.0;
-  return buf;
-}
-
-// ── Types ──
-interface SessionData {
-  stage: 'intent' | 'core_needs' | 'core_needs_timeline' | 'intent_specific' | 'value_exchange' | 'lead_name' | 'lead_phone' | 'lead_email' | 'handoff' | 'complete';
-  intent?: string;
-  location?: string;
-  budget?: string;
-  timeline?: string;
-  financing?: string;
-  bedrooms?: string;
-  zipCode?: string;
-  listingPreference?: string;
-  firstName?: string;
-  lastName?: string;
-  phone?: string;
-  email?: string;
-  contactPreference?: string;
-  bestTime?: string;
-}
-
-const INITIAL_SESSION: SessionData = { stage: 'intent' };
-
-const WELCOME = "Hi! I'm your real estate AI assistant. I can help you buy, rent, or sell... Are you looking to buy, rent, or sell today?";
-
-// ── System prompt (shared by text & voice) ──
-function systemPrompt(s: SessionData): string {
-  return `You are a friendly, warm real estate assistant for EstatePro. Talk like a real person — short, casual, natural sentences. You are a helpful friend who knows real estate.
-
-RULES:
-- NEVER use markdown (no **, ##, bullet points).
-- NEVER reveal internal reasoning, plans, or what you're "about to do."
-- NEVER say things like "I've registered", "shifting focus", "my assessment".
-- 1-3 short sentences max. Sound human, not robotic.
-
-STAGE: ${s.stage}
-DATA: ${JSON.stringify(s)}
-PROPERTIES: ${JSON.stringify(PROPERTIES)}
-
-WHAT TO SAY (only for current stage):
-
-intent → Figure out buy/rent/sell. Unclear? "Sorry, I didn't catch that. Are you looking to buy, rent, or sell?" Clear? "Great! Which area are you targeting? And what's your approximate budget range?"
-core_needs → They said area/budget. Acknowledge, then: "And what's your timeline?"
-core_needs_timeline → They said timeline. Then ask: buy→"Are you already pre-approved for a mortgage, or paying cash?" rent→"How many bedrooms are you looking for?" sell→"What's the zip code of the property you'd like to sell?"
-intent_specific → They answered. Pick 2 matching properties: "Found it! Here are 2 quick previews: 1. [Price] in [Location] — [feature]. 2. [Price] in [Location] — [feature]. Which one catches your eye, 1 or 2?"
-value_exchange → They picked. "Great taste! Can I get your name?"
-lead_name → Got name. "Thanks, [Name]! To send you the full photos and details, what's your cell phone number?"
-lead_phone → Got number? "Got it! And what's your email address?" Refused? "I totally get it — but I do need a way to send you the photos. How about just sharing your number for now?"
-lead_email → Got/skipped email. "Last thing — would you prefer our agent to reach out by text or call? And what time works best for you?"
-handoff → Got preference+time. "Perfect, [Name]! Our agent will [text/call] you around [time]. Excited to help you out!"
-complete → Chat naturally about properties.
-
-IMPORTANT — After your response, on a NEW line add (user won't see this):
-|||EXTRACT|||{"stage":"${s.stage}","next_stage":"<next>","data":{<fields>}}|||END|||
-Transitions: intent→core_needs→core_needs_timeline→intent_specific→value_exchange→lead_name→lead_phone→lead_email→handoff→complete
-Keys: intent, location, budget, timeline, financing, bedrooms, zipCode, listingPreference, firstName, lastName, phone, email, contactPreference, bestTime
-Keep next_stage = current stage if extraction incomplete.`;
-}
-
-// ── Email helpers ──
-async function buildAnalysis(msgs: ChatMessage[], s: SessionData): Promise<string> {
-  try {
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
-    const log = msgs.map(m => `${m.role === 'user' ? 'Customer' : 'Assistant'}: ${m.text}`).join('\n');
-    const r = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: `Analyze this real estate lead conversation:\n\n${log}\n\nLead data:\n${JSON.stringify(s, null, 2)}\n\nProvide: Lead quality (Hot/Warm/Cold), intent, requirements, follow-up approach, contact details.`,
-      config: { systemInstruction: 'You are a real estate lead analyst. Be concise and professional.' }
-    });
-    return r.text || 'Analysis unavailable.';
-  } catch {
-    return `Name: ${s.firstName} ${s.lastName}\nPhone: ${s.phone}\nEmail: ${s.email || 'N/A'}\nIntent: ${s.intent}\nLocation: ${s.location}\nBudget: ${s.budget}\nTimeline: ${s.timeline}\nContact: ${s.contactPreference} at ${s.bestTime}`;
-  }
-}
-
-async function sendEmail(s: SessionData, analysis: string): Promise<boolean> {
-  try {
-    const r = await fetch('/api/send-email', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        leadName: `${s.firstName || ''} ${s.lastName || ''}`.trim(),
-        phone: s.phone || '', email: s.email || '', intent: s.intent || '',
-        location: s.location || '', budget: s.budget || '', timeline: s.timeline || '',
-        financing: s.financing || '', bedrooms: s.bedrooms || '', zipCode: s.zipCode || '',
-        listingPreference: s.listingPreference || '', contactPreference: s.contactPreference || '',
-        bestTime: s.bestTime || '', analysis,
-      }),
-    });
-    return r.ok;
-  } catch { return false; }
-}
-
-// ── Component ──
 const AIConcierge: React.FC = () => {
   const [isOpen, setIsOpen] = useState(false);
-  const [mode, setMode] = useState<'text' | 'voice'>('text');
-  const [messages, setMessages] = useState<(ChatMessage & { grounding?: any[] })[]>([]);
-  const [inputText, setInputText] = useState('');
-  const [isConnecting, setIsConnecting] = useState(false);
-  const [isListening, setIsListening] = useState(false);
-  const [isModelTyping, setIsModelTyping] = useState(false);
-  const [session, setSession] = useState<SessionData>(INITIAL_SESSION);
-  const [emailSent, setEmailSent] = useState(false);
+  const [stage, setStage] = useState<ChatStage>(ChatStage.WELCOME);
+  const [sessionData, setSessionData] = useState<ChatSessionData>({});
+  const [messages, setMessages] = useState<ChatMessage[]>([
+    { role: 'model', text: 'Hi! I\'m your real estate AI assistant. I can help you buy, rent, or sell… Are you looking to buy, rent, or sell today?' }
+  ]);
+  const [input, setInput] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [isVoiceActive, setIsVoiceActive] = useState(false);
+  const [hasAutoOpened, setHasAutoOpened] = useState(false);
+  const [phoneRefusalCount, setPhoneRefusalCount] = useState(0);
+  const [liveInputText, setLiveInputText] = useState('');
+  const [liveOutputText, setLiveOutputText] = useState('');
 
-  // Refs
-  const welcomeSent = useRef(false);
-  const hasAutoPopped = useRef(false);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
-  const messagesRef = useRef(messages);
+  const scrollRef = useRef<HTMLDivElement>(null);
   const sessionRef = useRef<any>(null);
-  const sessionDataRef = useRef(session);
-  const emailSentRef = useRef(false);
-
-  // Audio refs
-  const inputAudioCtx = useRef<AudioContext | null>(null);
-  const outputAudioCtx = useRef<AudioContext | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const nextStartTimeRef = useRef<number>(0);
   const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
-  const nextPlayTime = useRef(0);
-  const mediaStreamRef = useRef<MediaStream | null>(null);
-  const speechRecRef = useRef<any>(null);
+  const currentInputTranscription = useRef('');
+  const currentOutputTranscription = useRef('');
+  const sessionDataRef = useRef<ChatSessionData>({});
 
-  // Voice text accumulator
-  const voiceTextBuf = useRef('');
-  const voiceMsgId = useRef<string | null>(null);
-  const isGeneratingText = useRef(false);
-
-  // Keep refs synced
-  useEffect(() => { messagesRef.current = messages; }, [messages]);
-  useEffect(() => { sessionDataRef.current = session; }, [session]);
-  useEffect(() => { emailSentRef.current = emailSent; }, [emailSent]);
-
-  // Scroll to bottom
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, isOpen]);
+    sessionDataRef.current = sessionData;
+  }, [sessionData]);
 
-  // Auto-pop on scroll to bottom
   useEffect(() => {
-    const onScroll = () => {
-      if (hasAutoPopped.current) return;
-      if (window.innerHeight + window.scrollY >= document.body.offsetHeight - 50) {
+    const handleScroll = () => {
+      if (hasAutoOpened) return;
+      const windowHeight = window.innerHeight;
+      const documentHeight = document.documentElement.scrollHeight;
+      const scrollTop = window.pageYOffset || document.documentElement.scrollTop;
+      if (windowHeight + scrollTop >= documentHeight - 100) {
         setIsOpen(true);
-        hasAutoPopped.current = true;
+        setHasAutoOpened(true);
       }
     };
-    window.addEventListener('scroll', onScroll);
-    return () => window.removeEventListener('scroll', onScroll);
-  }, []);
+    window.addEventListener('scroll', handleScroll);
+    return () => window.removeEventListener('scroll', handleScroll);
+  }, [hasAutoOpened]);
 
-  // Welcome message on first open
   useEffect(() => {
-    if (isOpen && messages.length === 0 && !welcomeSent.current) {
-      welcomeSent.current = true;
-      pushMsg('model', WELCOME);
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [isOpen]);
+  }, [messages, isLoading, isVoiceActive, liveInputText, liveOutputText]);
 
-  // ── Message helpers ──
-  const pushMsg = useCallback((role: 'user' | 'model', text: string, grounding?: any[]) => {
-    setMessages(prev => [...prev, {
-      id: Math.random().toString(36).substr(2, 9),
-      role, text, timestamp: new Date(), grounding,
-    }]);
-  }, []);
+  const buildEmailHtml = (
+    data: ChatSessionData,
+    result: { score: number; scoreReason: string; analysis: string },
+    chatHistory: ChatMessage[]
+  ): string => {
+    const { score, scoreReason, analysis } = result;
 
-  const clearChat = () => {
-    if (!window.confirm('Clear chat and start over?')) return;
-    setMessages([]);
-    setSession(INITIAL_SESSION);
-    setEmailSent(false);
-    welcomeSent.current = false;
+    const scoreColor = score >= 7 ? '#16a34a' : score >= 4 ? '#d97706' : '#dc2626';
+    const scoreBg    = score >= 7 ? '#dcfce7' : score >= 4 ? '#fef3c7' : '#fee2e2';
+    const scoreLabel = score >= 7 ? 'HOT LEAD' : score >= 4 ? 'WARM LEAD' : 'COLD LEAD';
+    const filledDots  = '\u25CF'.repeat(score);
+    const emptyDots   = '\u25CB'.repeat(10 - score);
+
+    const transcript = chatHistory
+      .map(m => `<tr>
+        <td style="padding:5px 8px;font-weight:bold;color:${m.role === 'user' ? '#2563eb' : '#374151'};white-space:nowrap;vertical-align:top">${m.role === 'user' ? 'Customer' : 'AI'}</td>
+        <td style="padding:5px 8px">${m.text}</td>
+      </tr>`)
+      .join('');
+
+    return `<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"><title>New Real Estate Lead</title></head>
+<body style="font-family:Arial,sans-serif;max-width:700px;margin:0 auto;color:#1f2937">
+
+  <!-- Header -->
+  <div style="background:#7f1d1d;color:white;padding:24px 28px;border-radius:10px 10px 0 0">
+    <h1 style="margin:0;font-size:22px;font-weight:700">New Real Estate Lead</h1>
+    <p style="margin:4px 0 0;opacity:.6;font-size:13px">EstatePro · AI Concierge Report · ${new Date().toLocaleString()}</p>
+  </div>
+
+  <!-- Lead Score Banner -->
+  <div style="background:${scoreBg};border:2px solid ${scoreColor};padding:20px 28px;display:flex;align-items:center;gap:20px">
+    <div style="text-align:center;min-width:80px">
+      <div style="font-size:42px;font-weight:900;color:${scoreColor};line-height:1">${score}</div>
+      <div style="font-size:10px;color:${scoreColor};font-weight:700;letter-spacing:.1em">&nbsp;OUT OF 10</div>
+    </div>
+    <div style="border-left:2px solid ${scoreColor};padding-left:20px;flex:1">
+      <div style="font-size:13px;font-weight:800;color:${scoreColor};letter-spacing:.12em;margin-bottom:6px">${scoreLabel}</div>
+      <div style="font-size:18px;letter-spacing:2px;color:${scoreColor};margin-bottom:8px">${filledDots}<span style="color:#d1d5db">${emptyDots}</span></div>
+      <p style="margin:0;font-size:13px;color:#374151;line-height:1.5">${scoreReason}</p>
+    </div>
+  </div>
+
+  <!-- Contact Information -->
+  <div style="background:#f8fafc;border:1px solid #e2e8f0;border-top:0;padding:20px 28px">
+    <h2 style="color:#7f1d1d;font-size:15px;font-weight:700;margin:0 0 14px;text-transform:uppercase;letter-spacing:.05em">Contact Details</h2>
+    <table style="width:100%;border-collapse:collapse">
+      <tr style="border-bottom:1px solid #f1f5f9"><td style="padding:8px 0;color:#64748b;width:160px;font-size:13px">Full Name</td><td style="padding:8px 0;font-weight:700;font-size:14px">${data.name || '\u2014'}</td></tr>
+      <tr style="border-bottom:1px solid #f1f5f9"><td style="padding:8px 0;color:#64748b;font-size:13px">Phone</td><td style="padding:8px 0;font-weight:700;font-size:14px;color:#7f1d1d">${data.phone || '\u2014'}</td></tr>
+      <tr style="border-bottom:1px solid #f1f5f9"><td style="padding:8px 0;color:#64748b;font-size:13px">Email</td><td style="padding:8px 0;font-size:14px">${data.email || '\u2014'}</td></tr>
+      <tr style="border-bottom:1px solid #f1f5f9"><td style="padding:8px 0;color:#64748b;font-size:13px">Preferred Contact</td><td style="padding:8px 0;font-size:14px">${data.contactPreference || '\u2014'}</td></tr>
+      <tr><td style="padding:8px 0;color:#64748b;font-size:13px">Best Time to Reach</td><td style="padding:8px 0;font-weight:700;font-size:14px;color:#16a34a">${data.bestTime || '\u2014'}</td></tr>
+    </table>
+  </div>
+
+  <!-- Property Requirements -->
+  <div style="background:#fff;border:1px solid #e2e8f0;border-top:0;padding:20px 28px">
+    <h2 style="color:#7f1d1d;font-size:15px;font-weight:700;margin:0 0 14px;text-transform:uppercase;letter-spacing:.05em">Property Requirements</h2>
+    <table style="width:100%;border-collapse:collapse">
+      <tr style="border-bottom:1px solid #f1f5f9"><td style="padding:8px 0;color:#64748b;width:160px;font-size:13px">Intent</td><td style="padding:8px 0"><span style="background:#fee2e2;color:#dc2626;padding:3px 10px;border-radius:12px;font-size:12px;font-weight:700">${data.intent || '\u2014'}</span></td></tr>
+      <tr style="border-bottom:1px solid #f1f5f9"><td style="padding:8px 0;color:#64748b;font-size:13px">Target Location</td><td style="padding:8px 0;font-size:14px">${data.location || '\u2014'}</td></tr>
+      <tr style="border-bottom:1px solid #f1f5f9"><td style="padding:8px 0;color:#64748b;font-size:13px">Budget Range</td><td style="padding:8px 0;font-weight:700;font-size:14px">${data.budget || '\u2014'}</td></tr>
+      <tr style="border-bottom:1px solid #f1f5f9"><td style="padding:8px 0;color:#64748b;font-size:13px">Timeline</td><td style="padding:8px 0;font-size:14px">${data.timeline || '\u2014'}</td></tr>
+      ${data.bedrooms ? `<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:8px 0;color:#64748b;font-size:13px">Bedrooms</td><td style="padding:8px 0;font-size:14px">${data.bedrooms}</td></tr>` : ''}
+      ${data.financingStatus ? `<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:8px 0;color:#64748b;font-size:13px">Financing</td><td style="padding:8px 0;font-size:14px">${data.financingStatus}</td></tr>` : ''}
+      ${data.zipCode ? `<tr style="border-bottom:1px solid #f1f5f9"><td style="padding:8px 0;color:#64748b;font-size:13px">Property Zip</td><td style="padding:8px 0;font-size:14px">${data.zipCode}</td></tr>` : ''}
+      ${data.listingPreference ? `<tr><td style="padding:8px 0;color:#64748b;font-size:13px">Preferred Listing</td><td style="padding:8px 0;font-size:14px">${data.listingPreference}</td></tr>` : ''}
+    </table>
+  </div>
+
+  <!-- AI Analysis -->
+  <div style="background:#fffbeb;border:1px solid #fcd34d;border-top:0;padding:20px 28px">
+    <h2 style="color:#92400e;font-size:15px;font-weight:700;margin:0 0 12px;text-transform:uppercase;letter-spacing:.05em">AI Lead Analysis</h2>
+    <p style="margin:0;line-height:1.75;font-size:14px;color:#1f2937;white-space:pre-wrap">${analysis}</p>
+  </div>
+
+  <!-- Transcript -->
+  <div style="background:#fff;border:1px solid #e2e8f0;border-top:0;padding:20px 28px">
+    <h2 style="color:#7f1d1d;font-size:15px;font-weight:700;margin:0 0 12px;text-transform:uppercase;letter-spacing:.05em">Full Chat Transcript</h2>
+    <table style="width:100%;border-collapse:collapse;font-size:13px">
+      ${transcript}
+    </table>
+  </div>
+
+  <!-- Footer -->
+  <div style="background:#7f1d1d;color:#94a3b8;padding:14px 28px;border-radius:0 0 10px 10px;font-size:11px;text-align:center">
+    EstatePro AI Concierge · 750 5th Avenue, New York, NY
+  </div>
+
+</body>
+</html>`;
   };
 
-  // ── Extraction parser ──
-  const parseExtraction = useCallback((fullText: string) => {
-    if (!fullText.includes('|||EXTRACT|||')) return fullText;
-    const [display, rest] = fullText.split('|||EXTRACT|||');
-    const jsonStr = rest?.split('|||END|||')[0]?.trim();
-    if (jsonStr) {
-      try {
-        const { data, next_stage } = JSON.parse(jsonStr);
-        setSession(prev => {
-          const updated = { ...prev };
-          if (data) Object.entries(data).forEach(([k, v]) => { if (v) (updated as any)[k] = v; });
-          if (next_stage) updated.stage = next_stage;
+  const emailSentRef = useRef(false);
 
-          // Trigger email at completion
-          if (updated.stage === 'complete' && updated.bestTime && !emailSentRef.current) {
-            setEmailSent(true);
-            emailSentRef.current = true;
-            (async () => {
-              try {
-                const analysis = await buildAnalysis(messagesRef.current, updated);
-                const ok = await sendEmail(updated, analysis);
-                pushMsg('model', ok
-                  ? "Awesome — I've sent your details over to our team. They'll be reaching out soon!"
-                  : "Your info is saved! Our team will reach out to you soon.");
-              } catch {
-                pushMsg('model', "Your info is saved! Our team will reach out to you soon.");
-              }
-            })();
-          }
-          return updated;
-        });
-      } catch (e) { console.error('Extract parse error:', e); }
-    }
-    return display.trim();
-  }, [pushMsg]);
-
-  // ── Text submit ──
-  const handleTextSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!inputText.trim()) return;
-    const text = inputText;
-    setInputText('');
-    pushMsg('user', text);
-    setIsModelTyping(true);
-
+  const triggerAgentNotification = async (data: ChatSessionData, chatHistory: ChatMessage[]) => {
+    if (emailSentRef.current) return;
+    emailSentRef.current = true;
+    console.log('Sending lead email for:', data.name, '| bestTime:', data.bestTime);
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
-      const history = [...messages.map(m => ({ role: m.role as 'user' | 'model', parts: [{ text: m.text }] })),
-        { role: 'user' as const, parts: [{ text }] }];
+      const result = await gemini.generateChatAnalysis(chatHistory, data);
+      const scoreLabel = result.score >= 7 ? 'HOT' : result.score >= 4 ? 'WARM' : 'COLD';
+      const subject = `[${scoreLabel} ${result.score}/10] New Lead: ${data.name || 'Unknown'} \u2013 ${data.intent || ''} \u2013 ${data.location || ''} \u2013 Call ${data.bestTime || 'TBD'}`;
+      const htmlContent = buildEmailHtml(data, result, chatHistory);
 
-      const r = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: history,
-        config: { tools: [{ googleMaps: {} }], systemInstruction: systemPrompt(session) },
+      const response = await fetch('/api/send-email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ subject, htmlContent }),
       });
 
-      const fullText = r.text || "Sorry, I couldn't process that. Could you try again?";
-      const grounding = r.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
-      const display = parseExtraction(fullText);
-      pushMsg('model', display, grounding);
-    } catch {
-      pushMsg('model', "Something went wrong on my end. Could you try again?");
-    } finally {
-      setIsModelTyping(false);
+      if (!response.ok) {
+        console.warn('Email API returned non-200:', await response.text());
+      } else {
+        console.log('Lead email sent successfully. Score:', result.score);
+      }
+    } catch (err) {
+      console.error('triggerAgentNotification error:', err);
     }
   };
 
-  // ── Audio helpers ──
-  const stopAudio = () => {
-    sourcesRef.current.forEach(s => { try { s.stop(); } catch {} });
-    sourcesRef.current.clear();
-    nextPlayTime.current = 0;
-  };
-
-  // ── Voice session ──
-  const startVoice = async () => {
-    if (isConnecting) return;
-    setIsConnecting(true);
-    setMode('voice');
+  const handleSend = async () => {
+    if (!input.trim() || isLoading) return;
+    const userText = input;
+    setInput('');
+    setMessages(prev => [...prev, { role: 'user', text: userText }]);
+    setIsLoading(true);
 
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
-      if (!inputAudioCtx.current) inputAudioCtx.current = new AudioContext({ sampleRate: 16000 });
-      if (!outputAudioCtx.current) outputAudioCtx.current = new AudioContext({ sampleRate: 24000 });
+      const response = await gemini.processMessage(userText, stage, sessionData, messages);
 
-      const mic = await navigator.mediaDevices.getUserMedia({ audio: true });
-      mediaStreamRef.current = mic;
+      const updatedData = { ...sessionData, ...(response.extractedData || {}) };
 
-      // SpeechRecognition for user transcript
-      const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-      if (SR) {
-        const rec = new SR();
-        rec.continuous = true;
-        rec.interimResults = false;
-        rec.lang = 'en-US';
-        rec.onresult = (ev: any) => {
-          const t = ev.results[ev.results.length - 1][0].transcript.trim();
-          if (t) pushMsg('user', t);
-        };
-        rec.onerror = (ev: any) => {
-          if (ev.error !== 'aborted') try { rec.start(); } catch {}
-        };
-        rec.onend = () => {
-          // auto-restart while voice mode is active
-          if (sessionRef.current) try { rec.start(); } catch {}
-        };
-        rec.start();
-        speechRecRef.current = rec;
+      if (response.extractedData) {
+        setSessionData(updatedData);
       }
 
-      const voiceSysPrompt = `You are a friendly real estate assistant on a voice call. Talk like a real person — casual, warm, short sentences.
+      if (stage === ChatStage.LEAD_CAPTURE_CONTACT && !response.extractedData?.phone && !sessionData.phone) {
+        setPhoneRefusalCount(prev => prev + 1);
+      }
 
-RULES:
-- NEVER describe what you're doing internally.
-- NEVER use markdown.
-- NEVER narrate your thought process.
-- Just say what you would actually say out loud to a person on the phone.
-- 1-3 short, natural sentences only.
+      setMessages(prev => [...prev, { role: 'model', text: response.message }]);
 
-STAGE: ${session.stage}
-DATA: ${JSON.stringify(session)}
-PROPERTIES: ${JSON.stringify(PROPERTIES)}
+      if (response.nextStage) {
+        setStage(response.nextStage);
+      }
 
-WHAT TO SAY (current stage only):
-intent → buy/rent/sell? Unclear: "Sorry, I didn't catch that. Are you looking to buy, rent, or sell?" Clear: "Great! Which area are you targeting? And what's your approximate budget range?"
-core_needs → Acknowledge area/budget, ask: "What's your timeline?"
-core_needs_timeline → Acknowledge timeline, ask: buy→"Are you pre-approved for a mortgage, or paying cash?" rent→"How many bedrooms?" sell→"What's the zip code?"
-intent_specific → Pick 2 properties: "Here are 2 options: 1. [Price] in [Location], [feature]. 2. [Price] in [Location], [feature]. Which sounds better, 1 or 2?"
-value_exchange → "Great taste! Can I get your name?"
-lead_name → "Thanks [Name]! What's your cell number so I can send you photos?"
-lead_phone → Got number: "Got it! And your email?" Refused: "I totally get it, but I need a way to send the photos. How about just your number for now?"
-lead_email → "Last thing — prefer a text or call from our agent? And what time works best?"
-handoff → "Perfect [Name]! Our agent will [text/call] you around [time]. Excited to help!"
-complete → Chat naturally.`;
+      const bestTimeJustCaptured = !sessionData.bestTime && updatedData.bestTime;
+      if (bestTimeJustCaptured) {
+        const finalMessages = [
+          ...messages,
+          { role: 'user' as const, text: userText },
+          { role: 'model' as const, text: response.message },
+        ];
+        triggerAgentNotification(updatedData, finalMessages);
+      }
+    } catch (error) {
+      console.error('Chat Error:', error);
+      setMessages(prev => [...prev, { role: 'model', text: "I'm sorry, I encountered an error. Please try again." }]);
+    } finally {
+      setIsLoading(false);
+    }
+  };
 
-      const liveSession = await ai.live.connect({
+  const startVoiceSession = async () => {
+    if (isVoiceActive) {
+      stopVoiceSession();
+      return;
+    }
+    try {
+      setIsLoading(true);
+      const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY || ((import.meta as any).env?.VITE_GEMINI_API_KEY as string);
+      if (!apiKey) throw new Error('API Key missing');
+
+      const ai = new GoogleGenAI({ apiKey });
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const inputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+      const outputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+      audioContextRef.current = outputCtx;
+      currentInputTranscription.current = '';
+      currentOutputTranscription.current = '';
+      setLiveInputText('');
+      setLiveOutputText('');
+
+      const updateLeadInfoTool = {
+        functionDeclarations: [
+          {
+            name: 'updateLeadInfo',
+            description: 'Update the lead information and conversation stage based on extracted data.',
+            parameters: {
+              type: Type.OBJECT,
+              properties: {
+                extractedData: {
+                  type: Type.OBJECT,
+                  properties: {
+                    intent: { type: Type.STRING },
+                    location: { type: Type.STRING },
+                    budget: { type: Type.STRING },
+                    timeline: { type: Type.STRING },
+                    bedrooms: { type: Type.STRING },
+                    financingStatus: { type: Type.STRING },
+                    zipCode: { type: Type.STRING },
+                    listingPreference: { type: Type.STRING },
+                    name: { type: Type.STRING },
+                    phone: { type: Type.STRING },
+                    email: { type: Type.STRING },
+                    contactPreference: { type: Type.STRING },
+                    bestTime: { type: Type.STRING },
+                  }
+                },
+                nextStage: { type: Type.STRING, description: 'The next stage to move the conversation to.' }
+              }
+            }
+          }
+        ]
+      };
+
+      const sessionPromise = ai.live.connect({
         model: 'gemini-2.5-flash-native-audio-preview-12-2025',
         callbacks: {
           onopen: () => {
-            setIsConnecting(false);
-            setIsListening(true);
-            // Stream mic audio to Gemini
-            const src = inputAudioCtx.current!.createMediaStreamSource(mic);
-            const proc = inputAudioCtx.current!.createScriptProcessor(4096, 1, 1);
-            proc.onaudioprocess = (e) => {
-              const inp = e.inputBuffer.getChannelData(0);
-              const i16 = new Int16Array(inp.length);
-              for (let i = 0; i < inp.length; i++) i16[i] = inp[i] * 32768;
-              if (sessionRef.current) {
-                sessionRef.current.sendRealtimeInput({
-                  media: { data: pcmEncode(new Uint8Array(i16.buffer)), mimeType: 'audio/pcm;rate=16000' }
-                });
-              }
+            setIsVoiceActive(true);
+            setIsLoading(false);
+            const source = inputCtx.createMediaStreamSource(stream);
+            const scriptProcessor = inputCtx.createScriptProcessor(4096, 1, 1);
+            scriptProcessor.onaudioprocess = (e) => {
+              const inputData = e.inputBuffer.getChannelData(0);
+              const l = inputData.length;
+              const int16 = new Int16Array(l);
+              for (let i = 0; i < l; i++) int16[i] = inputData[i] * 32768;
+              const pcmBlob = {
+                data: GeminiService.encodeBase64(new Uint8Array(int16.buffer)),
+                mimeType: 'audio/pcm;rate=16000',
+              };
+              sessionPromise.then((session) => { if (session) session.sendRealtimeInput({ media: pcmBlob }); });
             };
-            src.connect(proc);
-            proc.connect(inputAudioCtx.current!.destination);
+            source.connect(scriptProcessor);
+            scriptProcessor.connect(inputCtx.destination);
           },
-
-          onmessage: async (msg: LiveServerMessage) => {
-            const parts = msg.serverContent?.modelTurn?.parts || [];
-            for (const p of parts) {
-              // Play audio
-              if (p.inlineData?.data && outputAudioCtx.current) {
-                const ctx = outputAudioCtx.current;
-                nextPlayTime.current = Math.max(nextPlayTime.current, ctx.currentTime);
-                const buf = await toAudioBuffer(pcmDecode(p.inlineData.data), ctx, 24000);
-                const src = ctx.createBufferSource();
-                src.buffer = buf;
-                src.connect(ctx.destination);
-                src.start(nextPlayTime.current);
-                nextPlayTime.current += buf.duration;
-                sourcesRef.current.add(src);
-                src.onended = () => sourcesRef.current.delete(src);
+          onmessage: async (msg) => {
+            // Handle Tool Calls
+            if (msg.toolCall) {
+              for (const call of msg.toolCall.functionCalls) {
+                if (call.name === 'updateLeadInfo') {
+                  const args = call.args as any;
+                  let updatedSessionData: ChatSessionData = sessionDataRef.current;
+                  const prevBestTime = sessionDataRef.current.bestTime;
+                  if (args.extractedData) {
+                    updatedSessionData = { ...sessionDataRef.current, ...args.extractedData };
+                    setSessionData(updatedSessionData);
+                  }
+                  if (args.nextStage) {
+                    setStage(args.nextStage as ChatStage);
+                  }
+                  if (!prevBestTime && updatedSessionData.bestTime) {
+                    setMessages(prev => {
+                      triggerAgentNotification(updatedSessionData, prev);
+                      return prev;
+                    });
+                  }
+                  sessionPromise.then(session => {
+                    if (session) {
+                      session.sendToolResponse({
+                        functionResponses: [{
+                          name: 'updateLeadInfo',
+                          id: call.id,
+                          response: { result: 'success' }
+                        }]
+                      });
+                    }
+                  });
+                }
               }
             }
 
-            // On turn complete → generate matching text for chat
-            if (msg.serverContent?.turnComplete && !isGeneratingText.current) {
-              isGeneratingText.current = true;
-              try {
-                const textAi = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
-                const curMsgs = messagesRef.current;
-                const curSession = sessionDataRef.current;
+            // Accumulate live transcription for real-time display
+            if (msg.serverContent?.inputTranscription?.text) {
+              currentInputTranscription.current += msg.serverContent.inputTranscription.text;
+              setLiveInputText(currentInputTranscription.current);
+            }
+            if (msg.serverContent?.outputTranscription?.text) {
+              currentOutputTranscription.current += msg.serverContent.outputTranscription.text;
+              setLiveOutputText(currentOutputTranscription.current);
+            }
 
-                // Build history — only user messages so the text model generates what assistant should say
-                const history = curMsgs.slice(-12).map(m => ({
-                  role: m.role as 'user' | 'model',
-                  parts: [{ text: m.text }]
-                }));
-                if (history.length === 0) {
-                  history.push({ role: 'user' as const, parts: [{ text: 'Hello' }] });
-                }
-                // Make sure last message is from user
-                const lastMsg = history[history.length - 1];
-                if (lastMsg.role !== 'user') {
-                  // Nothing new from user, skip text generation
-                  isGeneratingText.current = false;
-                  return;
-                }
-
-                const r = await textAi.models.generateContent({
-                  model: 'gemini-2.5-flash',
-                  contents: history,
-                  config: {
-                    systemInstruction: systemPrompt(curSession),
-                  },
+            // On turn complete: commit transcriptions to chat messages
+            if (msg.serverContent?.turnComplete) {
+              const uText = currentInputTranscription.current.trim();
+              const mText = currentOutputTranscription.current.trim();
+              if (uText || mText) {
+                setMessages(prev => {
+                  const newMsgs = [...prev];
+                  if (uText) newMsgs.push({ role: 'user', text: uText });
+                  if (mText) newMsgs.push({ role: 'model', text: mText });
+                  return newMsgs;
                 });
-
-                const fullText = r.text?.trim() || '';
-                if (fullText) {
-                  const display = parseExtraction(fullText);
-                  if (display) pushMsg('model', display);
-                }
-              } catch (err) {
-                console.error('Voice text gen error:', err);
-              } finally {
-                isGeneratingText.current = false;
               }
+              currentInputTranscription.current = '';
+              currentOutputTranscription.current = '';
+              setLiveInputText('');
+              setLiveOutputText('');
             }
 
-            if (msg.serverContent?.interrupted) stopAudio();
-          },
+            const base64Audio = msg.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
+            if (base64Audio && audioContextRef.current) {
+              const audioCtx = audioContextRef.current;
+              nextStartTimeRef.current = Math.max(nextStartTimeRef.current, audioCtx.currentTime);
+              const buffer = await GeminiService.decodeAudioData(GeminiService.decodeBase64(base64Audio), audioCtx, 24000, 1);
+              const source = audioCtx.createBufferSource();
+              source.buffer = buffer;
+              source.connect(audioCtx.destination);
+              source.start(nextStartTimeRef.current);
+              nextStartTimeRef.current += buffer.duration;
+              sourcesRef.current.add(source);
+              source.onended = () => sourcesRef.current.delete(source);
+            }
 
-          onerror: () => { setIsConnecting(false); setIsListening(false); },
-          onclose: () => { setIsListening(false); setIsConnecting(false); },
+            if (msg.serverContent?.interrupted) {
+              sourcesRef.current.forEach(s => { try { s.stop(); } catch (e) {} });
+              sourcesRef.current.clear();
+              nextStartTimeRef.current = 0;
+            }
+          },
+          onerror: () => { stopVoiceSession(); },
+          onclose: () => { setIsVoiceActive(false); },
         },
         config: {
           responseModalities: [Modality.AUDIO],
-          systemInstruction: voiceSysPrompt,
+          systemInstruction: VOICE_FLOW_INSTRUCTION + `\n\nCURRENT SESSION STATE:\nStage: ${stage}\nData: ${JSON.stringify(sessionData)}`,
+          inputAudioTranscription: {},
+          outputAudioTranscription: {},
+          tools: [updateLeadInfoTool],
           speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } } },
-        },
+        }
       });
-
-      sessionRef.current = liveSession;
+      sessionRef.current = await sessionPromise;
     } catch (err) {
-      console.error('Voice start failed:', err);
-      setIsConnecting(false);
-      setMode('text');
+      setIsVoiceActive(false);
+      setIsLoading(false);
     }
   };
 
-  const stopVoice = () => {
-    if (speechRecRef.current) { try { speechRecRef.current.stop(); } catch {} speechRecRef.current = null; }
-    if (mediaStreamRef.current) { mediaStreamRef.current.getTracks().forEach(t => t.stop()); mediaStreamRef.current = null; }
-    if (sessionRef.current) { sessionRef.current.close(); sessionRef.current = null; }
-    stopAudio();
-    voiceTextBuf.current = '';
-    voiceMsgId.current = null;
-    isGeneratingText.current = false;
-    setIsListening(false);
-    setMode('text');
+  const stopVoiceSession = () => {
+    if (sessionRef.current) { try { sessionRef.current.close(); } catch (e) {} sessionRef.current = null; }
+    sourcesRef.current.forEach(source => { try { source.stop(); } catch (e) {} });
+    sourcesRef.current.clear();
+    nextStartTimeRef.current = 0;
+    setIsVoiceActive(false);
+    setIsLoading(false);
+    setLiveInputText('');
+    setLiveOutputText('');
   };
 
-  const handleClose = () => { stopVoice(); setIsOpen(false); };
-
-  const stageLabel: Record<string, string> = {
-    intent: 'Getting Started', core_needs: 'Understanding Needs', core_needs_timeline: 'Timeline',
-    intent_specific: 'Details', value_exchange: 'Property Matching', lead_name: 'Almost There',
-    lead_phone: 'Contact Info', lead_email: 'Contact Info', handoff: 'Scheduling', complete: 'Connected',
-  };
-
-  // ── Render ──
   return (
-    <div className="fixed bottom-8 right-8 z-[60] flex flex-col items-end">
+    <div className="fixed bottom-6 right-6 z-[100] flex flex-col items-end">
       {isOpen && (
-        <div className="mb-4 w-[400px] h-[600px] bg-white rounded-3xl shadow-2xl flex flex-col overflow-hidden border border-slate-200 animate-in slide-in-from-bottom-4 duration-300">
-          {/* Header */}
-          <div className="bg-red-950 p-6 text-white flex justify-between items-center">
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 bg-red-600 rounded-xl flex items-center justify-center"><Icons.Chat /></div>
+        <div className="bg-white w-[380px] h-[550px] mb-4 rounded-3xl shadow-2xl border border-slate-200 flex flex-col overflow-hidden animate-in fade-in slide-in-from-bottom-8">
+          <div className="p-5 bg-red-950 text-white flex justify-between items-center">
+            <div className="flex items-center space-x-3">
+              <div className="w-10 h-10 rounded-xl bg-red-600 flex items-center justify-center">
+                <MessageSquare className="w-5 h-5 text-white" />
+              </div>
               <div>
-                <h3 className="font-bold tracking-tight">AI Assistant</h3>
-                <p className="text-[10px] text-red-300 uppercase tracking-widest">
-                  {mode === 'voice' ? 'Listening...' : stageLabel[session.stage] || ''}
-                </p>
+                <h4 className="font-bold text-sm tracking-tight">EstatePro Concierge</h4>
+                <div className="flex items-center space-x-1">
+                  <span className={`w-2 h-2 rounded-full ${isVoiceActive ? 'bg-red-400 animate-pulse' : 'bg-red-500'}`}></span>
+                  <span className="text-[10px] text-red-300 uppercase tracking-widest font-black">
+                    {isVoiceActive ? 'Listening\u2026' : 'Active Now'}
+                  </span>
+                </div>
               </div>
             </div>
-            <div className="flex items-center gap-2">
-              {messages.length > 0 && (
-                <button onClick={clearChat} className="hover:bg-white/10 p-2 rounded-lg transition-colors text-slate-400 hover:text-white" title="Clear">
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
-                </button>
-              )}
-              <button onClick={handleClose} className="hover:bg-white/10 p-1 rounded-lg transition-colors"><Icons.X /></button>
-            </div>
+            <button onClick={() => { stopVoiceSession(); setIsOpen(false); }} className="hover:bg-white/10 p-1.5 rounded-lg transition-colors">
+              <X className="w-5 h-5" />
+            </button>
           </div>
 
-          {/* Messages */}
-          <div className="flex-grow overflow-y-auto p-6 space-y-4 bg-slate-50">
-            {messages.map(m => (
-              <div key={m.id} className={`flex flex-col ${m.role === 'user' ? 'items-end' : 'items-start'}`}>
-                <div className={`max-w-[85%] p-4 rounded-2xl text-sm leading-relaxed shadow-sm ${m.role === 'user' ? 'bg-red-600 text-white rounded-tr-none' : 'bg-white text-slate-700 border border-slate-100 rounded-tl-none'}`}>
-                  {m.text.split('\n').map((line, i) => (
-                    <React.Fragment key={i}>{i > 0 && <br />}{line}</React.Fragment>
-                  ))}
-                  {m.grounding && m.grounding.length > 0 && (
-                    <div className="mt-3 pt-3 border-t border-slate-100 space-y-1">
-                      <p className="text-[10px] font-bold text-red-400 uppercase tracking-tighter">Verified Locations</p>
-                      {m.grounding.map((c, i) => c.maps && <a key={i} href={c.maps.uri} target="_blank" rel="noopener noreferrer" className="block text-[11px] text-red-600 hover:underline truncate">📍 {c.maps.title || 'View on Maps'}</a>)}
-                    </div>
-                  )}
+          {/* Progress Bar */}
+          <div className="bg-red-900 px-5 py-2 flex items-center space-x-2 border-t border-white/5">
+            <div className="flex-1 h-1 bg-white/10 rounded-full overflow-hidden">
+              <div
+                className="h-full bg-red-500 transition-all duration-500 ease-out"
+                style={{
+                  width: `${(Object.values(ChatStage).indexOf(stage) + 1) / Object.values(ChatStage).length * 100}%`
+                }}
+              />
+            </div>
+            <span className="text-[8px] font-black text-white/40 uppercase tracking-widest">
+              Stage {Object.values(ChatStage).indexOf(stage) + 1}/8
+            </span>
+          </div>
+
+          <div ref={scrollRef} className="flex-1 overflow-y-auto p-5 space-y-4 bg-slate-50/50">
+            {messages.map((m, i) => (
+              <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'} animate-in fade-in slide-in-from-bottom-2`}>
+                <div className={`max-w-[85%] px-4 py-3 rounded-2xl text-sm leading-relaxed ${
+                  m.role === 'user'
+                    ? 'bg-red-600 text-white shadow-lg shadow-red-500/10 rounded-br-none'
+                    : 'bg-white text-slate-800 border border-slate-200 shadow-sm rounded-bl-none font-medium'
+                }`}>
+                  {m.text}
                 </div>
-                <span className="text-[10px] text-slate-400 mt-1 px-1">{m.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
               </div>
             ))}
-            {isModelTyping && (
-              <div className="flex gap-1 p-2">
-                <div className="w-1 h-1 bg-red-400 rounded-full animate-bounce" />
-                <div className="w-1 h-1 bg-red-400 rounded-full animate-bounce" style={{ animationDelay: '0.2s' }} />
-                <div className="w-1 h-1 bg-red-400 rounded-full animate-bounce" style={{ animationDelay: '0.4s' }} />
+
+            {/* Live voice transcription during active voice session */}
+            {isVoiceActive && (liveInputText || liveOutputText) && (
+              <div className="space-y-2">
+                {liveInputText && (
+                  <div className="flex justify-end">
+                    <div className="max-w-[85%] px-4 py-3 rounded-2xl rounded-br-none text-sm leading-relaxed bg-red-400/60 text-white italic animate-pulse">
+                      {liveInputText}
+                    </div>
+                  </div>
+                )}
+                {liveOutputText && (
+                  <div className="flex justify-start">
+                    <div className="max-w-[85%] px-4 py-3 rounded-2xl rounded-bl-none text-sm leading-relaxed bg-white/70 text-slate-600 border border-slate-200 italic animate-pulse">
+                      {liveOutputText}
+                    </div>
+                  </div>
+                )}
               </div>
             )}
-            {mode === 'voice' && (
-              <div className="flex flex-col items-center justify-center py-12 space-y-4">
-                <div className="flex items-end gap-1.5 h-16">
-                  {[...Array(7)].map((_, i) => (
-                    <div key={i} className="w-1.5 bg-red-600 rounded-full animate-pulse"
-                      style={{ animationDelay: `${i * 0.1}s`, height: isListening ? `${24 + Math.random() * 40}px` : '6px' }} />
-                  ))}
+
+            {isLoading && !isVoiceActive && (
+              <div className="flex justify-start">
+                <div className="bg-white border border-slate-200 px-4 py-3 rounded-2xl">
+                  <Loader2 className="w-4 h-4 text-red-600 animate-spin" />
                 </div>
-                <p className="text-xs text-slate-500">Voice conversation is transcribed below</p>
-                <button onClick={stopVoice} className="mt-6 bg-red-950 text-white px-8 py-3 rounded-xl text-sm font-bold shadow-lg hover:bg-red-600 transition-all active:scale-95">
-                  Return to Text
-                </button>
               </div>
             )}
-            <div ref={messagesEndRef} />
+
+            {isVoiceActive && !liveInputText && !liveOutputText && (
+              <div className="flex flex-col items-center justify-center py-4 space-y-3 bg-red-50/50 rounded-2xl border border-red-100 border-dashed">
+                <div className="w-10 h-10 bg-red-600 rounded-full flex items-center justify-center text-white animate-pulse">
+                  <Volume2 className="w-5 h-5" />
+                </div>
+                <p className="text-[10px] font-black uppercase text-red-600 tracking-[0.2em]">Voice Concierge Active</p>
+                <p className="text-[9px] text-slate-400">Speak now — conversation appears in chat</p>
+              </div>
+            )}
           </div>
 
-          {/* Input */}
-          {mode === 'text' && (
-            <div className="p-4 bg-white border-t border-slate-100">
-              <form onSubmit={handleTextSubmit} className="flex gap-2 mb-2">
-                <input type="text" value={inputText} onChange={e => setInputText(e.target.value)}
-                  placeholder="Type your message..."
-                  className="flex-grow bg-slate-100 border-none rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-red-600/20 transition-all" />
-                <button type="submit" className="bg-red-600 text-white w-12 h-12 rounded-xl hover:bg-red-700 transition-all shadow-sm flex items-center justify-center flex-shrink-0" aria-label="Send">
-                  <span className="rotate-90 inline-block transform scale-125"><Icons.Send /></span>
+          <div className="p-4 bg-white border-t border-slate-100 space-y-3">
+            <div className="flex items-center space-x-2">
+              <button
+                onClick={startVoiceSession}
+                className={`p-3 rounded-2xl transition-all shadow-lg active:scale-90 flex-shrink-0 ${
+                  isVoiceActive ? 'bg-red-500 text-white animate-pulse' : 'bg-slate-100 text-slate-500 hover:bg-red-50 hover:text-red-600'
+                }`}
+                title={isVoiceActive ? 'Stop voice' : 'Start voice'}
+              >
+                {isVoiceActive ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
+              </button>
+              <div className="flex-1 flex items-center bg-slate-100 px-3 py-2 rounded-2xl border border-transparent focus-within:border-red-500/50 focus-within:bg-white transition-all shadow-inner">
+                <input
+                  type="text"
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && handleSend()}
+                  placeholder={isVoiceActive ? 'Listening over voice\u2026' : 'Ask our advisor\u2026'}
+                  disabled={isVoiceActive}
+                  className="flex-1 bg-transparent text-sm px-2 focus:outline-none text-slate-900 font-semibold placeholder:text-slate-400 disabled:opacity-50"
+                />
+                <button
+                  onClick={handleSend}
+                  disabled={isLoading || !input.trim() || isVoiceActive}
+                  className="bg-red-600 text-white p-2 rounded-xl hover:bg-red-700 transition-colors disabled:opacity-30"
+                >
+                  <Send className="w-4 h-4" />
                 </button>
-              </form>
-              <div className="flex justify-between items-center px-1">
-                <button type="button" onClick={startVoice} className="flex items-center gap-1.5 text-red-600 text-[11px] font-bold hover:text-red-700 transition-colors">
-                  <Icons.Mic />Talk
-                </button>
-                <p className="text-[9px] text-slate-400 font-medium uppercase tracking-widest">EstatePro AI v3.0</p>
               </div>
             </div>
-          )}
+          </div>
         </div>
       )}
 
-      {!isOpen && (
-        <button onClick={() => setIsOpen(true)} className="bg-red-950 text-white w-14 h-14 rounded-2xl shadow-2xl flex items-center justify-center hover:scale-105 transition-all active:scale-95 group relative border border-white/10">
-          <Icons.Chat />
-          <span className="absolute -top-12 right-0 bg-red-950 text-white px-4 py-2 rounded-xl text-xs font-bold whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity shadow-xl border border-white/10">AI Assistant</span>
-        </button>
-      )}
+      <button
+        onClick={() => { if (isOpen && isVoiceActive) stopVoiceSession(); setIsOpen(!isOpen); }}
+        className={`w-14 h-14 rounded-full flex items-center justify-center shadow-2xl transition-all duration-300 hover:scale-110 active:scale-95 group ${
+          isOpen ? 'bg-red-950 text-white' : 'bg-red-600 text-white'
+        }`}
+      >
+        {isOpen ? <X /> : <MessageSquare className="group-hover:animate-bounce" />}
+        {!isOpen && (
+          <span className="absolute right-16 bg-white border border-slate-200 text-slate-900 px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity shadow-lg pointer-events-none">
+            AI Concierge
+          </span>
+        )}
+      </button>
     </div>
   );
 };
