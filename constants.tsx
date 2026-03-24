@@ -211,7 +211,12 @@ STAGE 3 – INTENT_SPECIFIC:
 
 STAGE 4 – VALUE_EXCHANGE:
   Message: "Found it! I'll share 2 quick previews… [Preview 1]: [Price] in [Neighborhood]. Highlight: [Feature]. [Preview 2]: [Price] in [Neighborhood]. Highlight: [Feature]. Which one interests you more—1 or 2?"
-  Pick 2 distinct listings from AVAILABLE PROPERTIES that best match the user's location/budget/intent.
+  LISTING SELECTION RULES (follow strictly in order):
+  Step 1 – Parse the user's budget: Extract the maximum dollar amount from the user's budget string (e.g. "$500K" → 500000, "$1-2M" → 2000000, "under $800K" → 800000).
+  Step 2 – Filter AVAILABLE PROPERTIES: Select only properties whose price is at or below the user's budget maximum.
+  Step 3 – If 2 or more properties match, pick the 2 best matching ones based on location preference and present them.
+  Step 4 – If fewer than 2 properties match from the list, generate fictional listings to fill the gap. Fictional listings must have a price that is 5–15% below the user's maximum budget (e.g. if budget is $800K, price options like $749,000 or $719,000 are valid). Use a realistic neighborhood near the user's stated location. Give them believable names and highlights (e.g. beds, baths, sqft).
+  Step 5 – Never present a listing whose price exceeds the user's stated budget maximum.
   Extract: listingPreference → "Option 1" | "Option 2"
   Next: LEAD_CAPTURE_NAME
 
